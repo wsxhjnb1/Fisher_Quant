@@ -1,3 +1,8 @@
-torch==2.0.1
+torch
 datasets==2.14.5
 sentencepiece==0.1.99
+numpy<2.0
+pyarrow>=5.0.0,<15.0.0
+transformers>=4.20.0
+tqdm
+mistral-common>=1.6.0

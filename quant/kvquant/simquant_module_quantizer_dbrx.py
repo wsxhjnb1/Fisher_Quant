@@ -584,8 +584,8 @@ class QuantLinearSim(nn.Module):
                 ):
 
         super().__init__()
-        if bits not in [2,3,4,5]:
-            raise NotImplementedError("Only 3, 4, 5 bits are supported.")
+        if bits not in [1,2,3,4,5]:
+            raise NotImplementedError("Only 1, 2, 3, 4, 5 bits are supported.")
         self.name = name
         self.infeatures = infeatures
         self.outfeatures = outfeatures

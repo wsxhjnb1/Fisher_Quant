@@ -246,33 +246,35 @@ def train():
         model.resize_token_embeddings(32001)
 
     model = model.bfloat16()
-    try:
-        model.lm_head.cuda()
-    except:
-        pass
+    model.cuda()
 
     if model_args.load != "":
         model.load_state_dict(torch.load(model_args.load), strict=False)
         model.eval()
 
-    # NOTE: this is llama-specific
     # For other models, replace this with proper variable names for model and layers
     _model = model.model
     _layers = _model.layers
-    _model.set_devices()
+    
+    act_grads = {}
+    def get_act_grad_hook(name):
+        def hook(module, grad_in, grad_out):
+            act_grads[name] = grad_out[0]
+        return hook
+
     grads = {}
+
+    for i, layer in enumerate(_layers):
+        k_proj, v_proj = get_modules_kv(layer)
+        k_proj.register_full_backward_hook(get_act_grad_hook(f'k_proj{i}'))
+        v_proj.register_full_backward_hook(get_act_grad_hook(f'v_proj{i}'))
 
     # main loop
     for i, data in tqdm(enumerate(dataloader[:data_args.num_examples])):
         data = data[0]
         x = data.cuda()
 
-        # act gradients
-        for n, layer in enumerate(_layers):
-            k_proj, v_proj = get_modules_kv(layer)
-            k_proj.retain_grad = True
-            v_proj.retain_grad = True
-
+        model.zero_grad()
         # compute gradients
         outputs = model(input_ids=x, labels=x)
         loss = outputs.loss
@@ -281,9 +283,8 @@ def train():
         # get grads
         for i, layer in enumerate(_layers):
             print(f'weight layer {i}')
-            k_proj, v_proj = get_modules_kv(layer)
-            kgrad = (k_proj.act.grad ** 2).float().cpu()
-            vgrad = (v_proj.act.grad ** 2).float().cpu()
+            kgrad = (act_grads[f'k_proj{i}'] ** 2).float().cpu()
+            vgrad = (act_grads[f'v_proj{i}'] ** 2).float().cpu()
 
             if f'k_proj{i}' not in grads:
                 grads[f'k_proj{i}'] = kgrad

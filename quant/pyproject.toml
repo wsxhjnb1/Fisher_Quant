@@ -20,7 +20,9 @@ dependencies = [
     "transformers>=4.28.0",
     "datasets",
     "scikit-learn",
-    "matplotlib"
+    "matplotlib",
+    "protobuf",
+    "mistral-common>=1.6.0"
 ]
 
 [tool.setuptools.packages.find]

@@ -38,7 +38,7 @@ def get_model(model, seqlen, maxseqlen):
         config.rope_scaling = {"type": "linear", "factor": scaling_factor}
 
     from transformers import AutoModelForCausalLM
-    model = AutoModelForCausalLM.from_pretrained(model, config=config, trust_remote_code=True, use_flash_attention_2=True, torch_dtype=torch.half)
+    model = AutoModelForCausalLM.from_pretrained(model, config=config, trust_remote_code=True, attn_implementation="flash_attention_2", torch_dtype=torch.half)
 
     model.seqlen = seqlen  #TODO
     if config.vocab_size == 32001:
@@ -50,7 +50,10 @@ def llama_eval(model, testenc, dev):
     print('Evaluating ...')
     model_type = parse_model(model)
 
-    testenc = testenc.input_ids
+    if isinstance(testenc, dict):
+        testenc = testenc['input_ids']
+    else:
+        testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
 
     use_cache = model.config.use_cache
@@ -77,6 +80,8 @@ def llama_eval(model, testenc, dev):
             cache['attention_mask'] = kwargs['attention_mask']
             if 'position_ids' in kwargs:
                 cache['position_ids'] = kwargs['position_ids']
+            if 'position_embeddings' in kwargs:
+                cache['position_embeddings'] = kwargs['position_embeddings']
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -95,7 +100,8 @@ def llama_eval(model, testenc, dev):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
+    position_ids = cache.get('position_ids')
+    position_embeddings = cache.get('position_embeddings')
 
     for i in range(len(layers)):
         print("Layer", i)
@@ -108,11 +114,16 @@ def llama_eval(model, testenc, dev):
                     attention_mask=attention_mask,
                 )[0]
             else:
-                assert model_type == 'llama'
+                # assert model_type == 'llama'
+                layer_kwargs = {
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                }
+                if position_embeddings is not None:
+                    layer_kwargs["position_embeddings"] = position_embeddings
                 outs[j] = layer(
                     inps[j].unsqueeze(0),
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
+                    **layer_kwargs,
                 )[0]
 
         layers[i] = layer.cpu()
@@ -172,6 +183,8 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
             cache['position_ids'] = kwargs['position_ids']
+            if 'position_embeddings' in kwargs:
+                cache['position_embeddings'] = kwargs['position_embeddings']
             raise ValueError
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
@@ -189,6 +202,7 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
     outs = torch.zeros_like(inps)
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
+    position_embeddings = cache.get('position_embeddings')
 
     print('Quantizing ...')
 
@@ -245,10 +259,15 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
             handles.append(subset[name].register_forward_hook(add_batch(name)))
 
         for j in range(args.nsamples):
+            layer_kwargs = {
+                "attention_mask": attention_mask,
+                "position_ids": position_ids
+            }
+            if position_embeddings is not None:
+                layer_kwargs["position_embeddings"] = position_embeddings
             outs[j] = layer(
                 inps[j].unsqueeze(0),
-                attention_mask=attention_mask,
-                position_ids=position_ids
+                **layer_kwargs,
             )[0]
 
         for h in handles:
@@ -319,7 +338,7 @@ if __name__ == '__main__':
         help='Whether to run calibration to quantize the KV cache.'
     )
     parser.add_argument(
-        '--abits', type=int, default=16, choices=[2, 3, 4, 5, 16],
+        '--abits', type=int, default=16, choices=[1, 2, 3, 4, 5, 16],
         help='#bits to use for quantization; use 16 for evaluating base model.'
     )
     parser.add_argument(
