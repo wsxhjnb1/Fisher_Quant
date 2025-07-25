@@ -22,7 +22,8 @@ dependencies = [
     "scikit-learn",
     "matplotlib",
     "protobuf",
-    "mistral-common>=1.6.0"
+    "mistral-common>=1.6.0",
+    "cuml-cu12"
 ]
 
 [tool.setuptools.packages.find]

@@ -2,15 +2,80 @@ import numpy as np
 import torch
 import torch.nn as nn
 import math
-from sklearn.cluster import KMeans
+# GPU-accelerated KMeans using cuML (RAPIDS)
+try:
+    from cuml import KMeans as cuMLKMeans
+    CUML_AVAILABLE = True
+    print("Using cuML KMeans for GPU acceleration")
+except ImportError:
+    CUML_AVAILABLE = False
+    print("Warning: cuML not available, falling back to CPU sklearn. Install cuML for GPU acceleration: pip install cuml")
 
 import torch
 from torch.distributions import Normal
 
-def round_to_nearest_pole_sim(w, poles):
+def gpu_kmeans_clustering(data, n_clusters, sample_weight=None, device=None, max_iter=50):
+    """
+    GPU-accelerated KMeans clustering using cuML (RAPIDS)
+    """
+    if device is None:
+        device = data.device
+    
+    if CUML_AVAILABLE:
+        try:
+            # Convert PyTorch tensor to CuPy array for cuML (more efficient GPU->GPU transfer)
+            import cupy as cp
+            
+            if data.is_cuda:
+                # Direct GPU memory access without CPU transfer
+                data_cupy = cp.asarray(data.detach())
+            else:
+                # If data is on CPU, convert via numpy
+                data_cupy = cp.asarray(data.detach().numpy())
+            
+            # Create cuML KMeans with sklearn-compatible API
+            kmeans_cuml = cuMLKMeans(
+                n_clusters=n_clusters, 
+                max_iter=max_iter, 
+                random_state=0,
+                n_init='auto'
+            )
+            
+            if sample_weight is not None:
+                if sample_weight.is_cuda:
+                    sample_weight_cupy = cp.asarray(sample_weight.detach())
+                else:
+                    sample_weight_cupy = cp.asarray(sample_weight.detach().numpy())
+                kmeans_cuml.fit(data_cupy, sample_weight=sample_weight_cupy)
+            else:
+                kmeans_cuml.fit(data_cupy)
+            
+            # Convert cluster centers back to numpy
+            return cp.asnumpy(kmeans_cuml.cluster_centers_)
+                
+        except ImportError as e:
+            print(f"cuML or CuPy import failed, falling back to CPU sklearn: {e}")
+        except Exception as e:
+            print(f"cuML KMeans failed, falling back to CPU sklearn: {e}")
+    
+    # Fallback to sklearn CPU implementation
+    from sklearn.cluster import KMeans
+    data_cpu = data.cpu().numpy()
+    if sample_weight is not None:
+        sample_weight_cpu = sample_weight.cpu().numpy()
+        kmeans_sklearn = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto", max_iter=max_iter)
+        kmeans_sklearn.fit(data_cpu, sample_weight=sample_weight_cpu)
+    else:
+        kmeans_sklearn = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto", max_iter=max_iter)
+        kmeans_sklearn.fit(data_cpu)
+    
+    return kmeans_sklearn.cluster_centers_
+
+def round_to_nearest_pole_sim(w, poles, return_freq=False):
     """
     w: weight/act values (1d vector)
     poles: tuple of values
+    return_freq: whether to also return frequency of each pole usage
 
     Round the numbers in w to the nearest value in poles.
     """
@@ -23,9 +88,15 @@ def round_to_nearest_pole_sim(w, poles):
     aug = 0
     freq = []
     for i, c in enumerate(poles):
-        aug += (idx == i) * c
+        mask = (idx == i)
+        aug += mask * c
+        if return_freq:
+            freq.append(mask.sum().item())
 
-    return aug
+    if return_freq:
+        return aug, freq
+    else:
+        return aug
 
 def get_outliers(
     w,
@@ -368,7 +439,8 @@ class SimQuant:
                     bits,
                     perchannel=True,
                     qchannel=0,
-                    include_rope=False
+                    include_rope=False,
+                    seqlen=2048
                 ):
         self.layer = layer
         self.dev = self.layer.weight.device
@@ -376,6 +448,7 @@ class SimQuant:
         self.perchannel = perchannel
         self.qchannel = qchannel
         self.bits = bits
+        self.seqlen = seqlen  # Store sequence length
 
         self.rows = W.shape[0]
         self.columns = W.shape[1]
@@ -415,15 +488,16 @@ class SimQuant:
             t = 1 #use min-max quantization
 
         #TODO - if not using sparsity, use a different threshold for min-max quant?
-        data = self.out.float().cpu().numpy()
-
+        # Keep data on GPU throughout
+        data = self.out.float()
+        device = data.device
 
         if self.perchannel and cap_outliers:
             #per-channel - remove tokenwise outliers and normalize range to [-1,1]
-            data = torch.tensor(data)
-
-            outlier_threshold_upper = torch.tensor(np.percentile(data, t*100, axis=self.qchannel)).unsqueeze(self.qchannel)
-            outlier_threshold_lower = torch.tensor(np.percentile(data, (1-t)*100, axis=self.qchannel)).unsqueeze(self.qchannel)
+            
+            # Use torch.quantile instead of np.percentile for GPU acceleration
+            outlier_threshold_upper = torch.quantile(data, t, dim=self.qchannel).unsqueeze(self.qchannel)
+            outlier_threshold_lower = torch.quantile(data, 1-t, dim=self.qchannel).unsqueeze(self.qchannel)
             zero_point = (outlier_threshold_upper + outlier_threshold_lower) / 2
             distance = (outlier_threshold_upper - outlier_threshold_lower) / 2
             data2 = ((data - zero_point) / distance).abs()
@@ -441,11 +515,11 @@ class SimQuant:
             if first_few_fp16 > -1 :
                 # remove first few tokens
                 for i in range(0,self.nsamples):
-                    start = i*2048
-                    end = i*2048 + first_few_fp16
+                    start = i*self.seqlen
+                    end = i*self.seqlen + first_few_fp16
                     outlier_mask[start:end,:] = True
 
-            med = torch.median(data, dim=0).values.unsqueeze(0).repeat(32768,1)
+            med = torch.median(data, dim=0).values.unsqueeze(0).repeat(data.shape[0],1)
             data_trimmed = data.clone()
             data_trimmed[outlier_mask] = med[outlier_mask] 
 
@@ -462,16 +536,14 @@ class SimQuant:
 
         if self.perchannel:
             #per-channel - remove tokenwise outliers and normalize range to [-1,1]
-            outlier_threshold_upper = np.percentile(data, t*100, axis=self.qchannel)
-            outlier_threshold_lower = np.percentile(data, (1-t)*100, axis=self.qchannel)
+            # Use torch.quantile instead of np.percentile for GPU acceleration
+            outlier_threshold_upper = torch.quantile(data, t, dim=self.qchannel).unsqueeze(self.qchannel)
+            outlier_threshold_lower = torch.quantile(data, 1-t, dim=self.qchannel).unsqueeze(self.qchannel)
         else:
             #per-token - remove tokenwise outliers and normalize range to [-1,1]
             assert(False) # not currently supported
 
-        # convert to torch
-        data = torch.tensor(data)
-        outlier_threshold_upper = torch.tensor(outlier_threshold_upper).unsqueeze(self.qchannel)
-        outlier_threshold_lower = torch.tensor(outlier_threshold_lower).unsqueeze(self.qchannel)
+        # Data is already torch tensor on GPU, no conversion needed
 
         # range and offset
         rangeval = (outlier_threshold_upper - outlier_threshold_lower) / 2
@@ -490,49 +562,47 @@ class SimQuant:
         # remove first few tokens
         if first_few_fp16 > -1:
             for i in range(0,self.nsamples):
-                start = i*2048
-                end = i*2048 + first_few_fp16
+                start = i*self.seqlen
+                end = i*self.seqlen + first_few_fp16
                 outlier_mask[start:end,:] = True
 
         if nuq:
             centroids = []
-            act_distn_np = data_shifted_normalized.flatten()
+            act_distn_tensor = data_shifted_normalized.flatten()
             n_cluster = 2 ** self.bits
 
             outlier_mask_unflattened = outlier_mask
             outlier_mask = outlier_mask.flatten()
-            act_distn_np_without_outliers = act_distn_np[~outlier_mask]
-            act_distn_np_without_outliers = act_distn_np_without_outliers.float().cpu().numpy().reshape(-1, 1)
+            act_distn_tensor_without_outliers = act_distn_tensor[~outlier_mask]
+            act_distn_tensor_without_outliers = act_distn_tensor_without_outliers.float().reshape(-1, 1)
 
             # load fisher info
             if fisher is not None:
-                fisher_info = fisher.flatten()
+                fisher_info = fisher.flatten().to(device)  # Move fisher_info to GPU
                 fisher_info_tmp_without_outliers = fisher_info[~outlier_mask]
-                kmeans = KMeans(
+                # Use GPU-accelerated KMeans
+                cluster_centers = gpu_kmeans_clustering(
+                    act_distn_tensor_without_outliers,
                     n_clusters=n_cluster,
-                    random_state=0,
-                    n_init="auto",
-                    max_iter=50,
-                ).fit(
-                    act_distn_np_without_outliers,
                     sample_weight=fisher_info_tmp_without_outliers,
+                    device=device,
+                    max_iter=50
                 )
             else:
-                kmeans = KMeans(
+                # Use GPU-accelerated KMeans
+                cluster_centers = gpu_kmeans_clustering(
+                    act_distn_tensor_without_outliers,
                     n_clusters=n_cluster,
-                    random_state=0,
-                    n_init="auto",
-                    max_iter=50,
-                ).fit(
-                    act_distn_np_without_outliers
+                    device=device,
+                    max_iter=50
                 )
 
-            centroids.append(kmeans.cluster_centers_)
+            centroids.append(cluster_centers)
 
             #Q-Norm
             if norm:
-                centroid = torch.tensor(centroids[0])
-                aug = torch.tensor(data_shifted_normalized)
+                centroid = torch.tensor(centroids[0], device=device)
+                aug = data_shifted_normalized  # Already on GPU
                 not_outlier_mask_unflattened = ~outlier_mask_unflattened
 
                 m1 = (aug*not_outlier_mask_unflattened).sum()/not_outlier_mask_unflattened.sum()
@@ -591,7 +661,7 @@ class QuantLinearSim(nn.Module):
         self.bits = bits
 
         self.weight = weight.T.detach().cpu()
-        if bias:
+        if bias is not None:
             self.bias = bias.detach().cpu()
         else:
             self.bias = None
@@ -820,7 +890,7 @@ def make_quant_sim(
                                                     tmp.in_features,
                                                     tmp.out_features,
                                                     tmp.weight,
-                                                    tmp.bias is not None,
+                                                    tmp.bias,
                                                     perchannel=perchannel,
                                                     include_sparse=include_sparse,
                                                     sparsity_threshold=sparsity_threshold,

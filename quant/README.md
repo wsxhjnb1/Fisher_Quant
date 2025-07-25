@@ -19,8 +19,6 @@ pip install -e .
 pip install flash-attn --no-build-isolation
 ```
 
-3. (Optional) For DBRX evaluation, please install transformers from source in the dbrx directory.
-
 ---
 ## Scripts for evaluating LLaMA / Mistral Models
 

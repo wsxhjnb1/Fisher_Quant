@@ -83,6 +83,11 @@ def llama_eval(model, testenc, dev):
             if 'position_embeddings' in kwargs:
                 cache['position_embeddings'] = kwargs['position_embeddings']
             raise ValueError
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.module, name)
 
     layers[0] = Catcher(layers[0])
     for i in range(nsamples):
@@ -186,6 +191,11 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
             if 'position_embeddings' in kwargs:
                 cache['position_embeddings'] = kwargs['position_embeddings']
             raise ValueError
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.module, name)
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
@@ -237,14 +247,16 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
                                         subset[name],
                                         bits,
                                         perchannel=True,
-                                        qchannel=0
+                                        qchannel=0,
+                                        seqlen=model.seqlen
                                      )
             elif name in pertensor_list:
                 simquant[name] = SimQuant(
                                         subset[name],
                                         bits,
                                         perchannel=True,
-                                        qchannel=-1
+                                        qchannel=-1,
+                                        seqlen=model.seqlen
                                      )
             else:
                 continue
