@@ -193,7 +193,9 @@ def quant_fn_zp(
     outlier_mask=None,
     maxval=-1,
     minval=-1,
-    clamp=False
+    clamp=False,
+    group_size=-1,
+    one_group=False
 ):
     """
     inp: weight/act values (2d matrix)
@@ -208,9 +210,11 @@ def quant_fn_zp(
 
     Performs simulated integer quantization
     """
+    inp_shape = inp.shape
+    num_groups = inp_shape[qchannel] // group_size
 
     # set quantization threshold dynamically
-    if dynamicquantization:
+    if dynamicquantization or group_size > 0:
         if include_sparse:
             outliers = inp * outlier_mask
             median = torch.median(inp, dim=qchannel).values
@@ -222,8 +226,18 @@ def quant_fn_zp(
             maxval = torch.max(tmp_inp, dim=qchannel).values
             minval = torch.min(tmp_inp, dim=qchannel).values
         else:
-            maxval = torch.max(inp, dim=qchannel).values
-            minval = torch.min(inp, dim=qchannel).values
+            if group_size > 0 and not one_group:
+                if qchannel == 0:
+                    inp = inp.reshape(num_groups, group_size, -1)
+                    maxval = torch.max(inp, dim=1, keepdim=True).values
+                    minval = torch.min(inp, dim=1, keepdim=True).values
+                else:
+                    inp = inp.reshape(-1, num_groups, group_size)
+                    maxval = torch.max(inp, dim=-1, keepdim=True).values
+                    minval = torch.min(inp, dim=-1, keepdim=True).values
+            else:
+                maxval = torch.max(inp, dim=qchannel, keepdim=True).values
+                minval = torch.min(inp, dim=qchannel, keepdim=True).values
 
     # compute offset here:
     rangeval = (maxval - minval)
@@ -235,9 +249,6 @@ def quant_fn_zp(
         offset = offset.clamp(-(2**bits - 1), 0)
     else: # improves accuracy with per-channel key quantization
         offset = minval * qx
-
-    offset = offset.unsqueeze(qchannel)
-    qx = qx.unsqueeze(qchannel)
 
     # need to handle outlier removal
     if include_sparse:
@@ -270,7 +281,9 @@ def quant_fn_nf(
     outlier_mask=None,
     maxval=-1,
     minval=-1,
-    nf_lut=None
+    nf_lut=None,
+    group_size=-1,
+    one_group=False
 ):
     """
     inp: weight/act values (2d matrix)
@@ -285,9 +298,11 @@ def quant_fn_nf(
 
     Performs simulated NormalFloat quantization
     """
+    inp_shape = inp.shape
+    num_groups = inp_shape[qchannel] // group_size
 
     # set quantization threshold dynamically
-    if dynamicquantization:
+    if dynamicquantization or group_size > 0:
         if include_sparse:
             outliers = inp * outlier_mask
             median = torch.median(inp, dim=qchannel).values
@@ -299,14 +314,22 @@ def quant_fn_nf(
             maxval = torch.max(tmp_inp, dim=qchannel).values
             minval = torch.min(tmp_inp, dim=qchannel).values
         else:
-            maxval = torch.max(inp, dim=qchannel).values
-            minval = torch.min(inp, dim=qchannel).values
+            if group_size > 0 and not one_group:
+                if qchannel == 0:
+                    inp = inp.reshape(num_groups, group_size, -1)
+                    maxval = torch.max(inp, dim=1, keepdim=True).values
+                    minval = torch.min(inp, dim=1, keepdim=True).values
+                else:
+                    inp = inp.reshape(-1, num_groups, group_size)
+                    maxval = torch.max(inp, dim=-1, keepdim=True).values
+                    minval = torch.min(inp, dim=-1, keepdim=True).values
+            else:
+                maxval = torch.max(inp, dim=qchannel, keepdim=True).values
+                minval = torch.min(inp, dim=qchannel, keepdim=True).values
 
     # compute offset here:
     offset = (maxval + minval) / 2
     rangeval = (maxval - minval) / 2
-    offset = offset.unsqueeze(qchannel)
-    rangeval = rangeval.unsqueeze(qchannel)
 
     # subtract offset
     inp = inp - offset
@@ -856,7 +879,9 @@ class QuantLinearSim(nn.Module):
                     include_sparse=self.include_sparse,
                     outlier_mask=outlier_mask,
                     dynamicquantization=self.dynamicquantization,
-                    nf_lut=self.nf_signposts
+                    nf_lut=self.nf_signposts,
+                    group_size=self.group_size,
+                    one_group=self.one_group
                 )
             else:
                 y = quant_fn_nuq_recon(
@@ -888,7 +913,9 @@ class QuantLinearSim(nn.Module):
                 include_sparse=self.include_sparse,
                 outlier_mask=outlier_mask,
                 dynamicquantization=self.dynamicquantization,
-                clamp=self.clamp
+                clamp=self.clamp,
+                group_size=self.group_size,
+                one_group=self.one_group
             )
 
         self.weight = self.weight.cpu()
