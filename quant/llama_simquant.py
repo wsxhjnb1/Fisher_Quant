@@ -130,6 +130,9 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
             model(batch[0].to(dev))
         except ValueError:
             pass
+        # Safety check to prevent index out of bounds
+        if cache['i'] >= args.nsamples:
+            break
     layers[0] = layers[0].module
 
     layers[0] = layers[0].cpu()

@@ -210,8 +210,6 @@ def quant_fn_zp(
 
     Performs simulated integer quantization
     """
-    inp_shape = inp.shape
-    num_groups = inp_shape[qchannel] // group_size
 
     # set quantization threshold dynamically
     if dynamicquantization or group_size > 0:
@@ -227,6 +225,8 @@ def quant_fn_zp(
             minval = torch.min(tmp_inp, dim=qchannel).values
         else:
             if group_size > 0 and not one_group:
+                inp_shape = inp.shape
+                num_groups = inp_shape[qchannel] // group_size
                 if qchannel == 0:
                     inp = inp.reshape(num_groups, group_size, -1)
                     maxval = torch.max(inp, dim=1, keepdim=True).values
@@ -298,8 +298,6 @@ def quant_fn_nf(
 
     Performs simulated NormalFloat quantization
     """
-    inp_shape = inp.shape
-    num_groups = inp_shape[qchannel] // group_size
 
     # set quantization threshold dynamically
     if dynamicquantization or group_size > 0:
@@ -315,6 +313,8 @@ def quant_fn_nf(
             minval = torch.min(tmp_inp, dim=qchannel).values
         else:
             if group_size > 0 and not one_group:
+                inp_shape = inp.shape
+                num_groups = inp_shape[qchannel] // group_size
                 if qchannel == 0:
                     inp = inp.reshape(num_groups, group_size, -1)
                     maxval = torch.max(inp, dim=1, keepdim=True).values
@@ -391,9 +391,6 @@ def quant_fn_nuq_recon(
     Performs simulated NUQ quantization
     """
 
-    inp_shape = inp.shape
-    num_groups = inp_shape[qchannel] // group_size
-
     if first_few_fp16 > -1:
         orig = inp
 
@@ -411,6 +408,8 @@ def quant_fn_nuq_recon(
             minval = torch.min(tmp_inp, dim=qchannel).values
         else:
             if group_size > 0 and not one_group:
+                inp_shape = inp.shape
+                num_groups = inp_shape[qchannel] // group_size
                 if qchannel == 0:
                     inp = inp.reshape(num_groups, group_size, -1)
                     maxval = torch.max(inp, dim=1, keepdim=True).values
@@ -443,7 +442,7 @@ def quant_fn_nuq_recon(
     Q = round_to_nearest_pole_sim(inp_scaled.flatten(), lut_cuda)
     qinp_out = Q.reshape(inp.shape).float().to(inp_scaled.device)
 
-    if norm:
+    if norm and (group_size == 0 or one_group):
         normscale = normscale.to(inp_scaled.device)
         normoffset = normoffset.to(inp_scaled.device)
         qinp_out = qinp_out*normscale + normoffset
@@ -656,7 +655,7 @@ class SimQuant:
             centroids.append(cluster_centers)
 
             #Q-Norm
-            if norm:
+            if norm and (self.group_size == 0 or self.one_group):
                 centroid = torch.tensor(centroids[0], device=device)
                 aug = data_shifted_normalized  # Already on GPU
                 not_outlier_mask_unflattened = ~outlier_mask_unflattened
@@ -766,63 +765,68 @@ class QuantLinearSim(nn.Module):
         # for normalfloat support - compute NF signposts
         if self.nf_nuq:
             dist = Normal(torch.tensor([0.0]), torch.tensor([1.0]))
-            # get evenly spaced percentile values
+            
+            if self.bits == 1:
+                # Special case for 1-bit quantization
+                # Use simple symmetric signposts
+                self.nf_signposts = [-1, 1]
+            else:
+                # get evenly spaced percentile values
+                num_signposts_pos = (2 ** (self.bits - 1)) + 1 # for pos half
+                num_signposts_neg = (2 ** (self.bits - 1)) # for neg half
 
-            num_signposts_pos = (2 ** (self.bits - 1)) + 1 # for pos half
-            num_signposts_neg = (2 ** (self.bits - 1)) # for neg half
+                self.nf_signposts_negative = []
+                self.nf_signposts_positive = []
 
-            self.nf_signposts_negative = []
-            self.nf_signposts_positive = []
+                # from https://arxiv.org/pdf/2306.06965.pdf
+                offsets = [0.5*(1/32 + 1/30), 1 - 0.5*(1/32 + 1/30)]
+                list1 = [offsets[0]]
+                spacing = (0.5 - offsets[0]) / (2 ** (self.bits - 1) - 1)
 
-            # from https://arxiv.org/pdf/2306.06965.pdf
-            offsets = [0.5*(1/32 + 1/30), 1 - 0.5*(1/32 + 1/30)]
-            list1 = [offsets[0]]
-            spacing = (0.5 - offsets[0]) / (2 ** (self.bits - 1) - 1)
+                add = offsets[0]
+                for i in range(num_signposts_neg - 1):
+                    add += spacing
+                    list1.append(add)
 
-            add = offsets[0]
-            for i in range(num_signposts_neg - 1):
-                add += spacing
-                list1.append(add)
+                list2 = []
+                spacing = (offsets[1] - 0.5) / (2 ** (self.bits - 1)) #1 extra space
+                add = 0.5
+                for i in range(num_signposts_pos - 1):
+                    list2.append(add)
+                    add += spacing
+                list2.append(offsets[-1])
 
-            list2 = []
-            spacing = (offsets[1] - 0.5) / (2 ** (self.bits - 1)) #1 extra space
-            add = 0.5
-            for i in range(num_signposts_pos - 1):
-                list2.append(add)
-                add += spacing
-            list2.append(offsets[-1])
+                # first do negative part [0->0.5]
+                for i in range(num_signposts_neg):
+                    v1 = list1[i]
+                    val = dist.icdf(torch.tensor([v1])).data.numpy()
+                    self.nf_signposts_negative.append(torch.tensor(val).item())
 
-            # first do negative part [0->0.5]
-            for i in range(num_signposts_neg):
-                v1 = list1[i]
-                val = dist.icdf(torch.tensor([v1])).data.numpy()
-                self.nf_signposts_negative.append(torch.tensor(val).item())
+                # next do positive part [0.5->1]
+                for i in range(num_signposts_pos):
+                    v1 = list2[i]
+                    val = dist.icdf(torch.tensor([v1])).data.numpy()
+                    self.nf_signposts_positive.append(torch.tensor(val).item())
 
-            # next do positive part [0.5->1]
-            for i in range(num_signposts_pos):
-                v1 = list2[i]
-                val = dist.icdf(torch.tensor([v1])).data.numpy()
-                self.nf_signposts_positive.append(torch.tensor(val).item())
+                signpost_neg_min = self.nf_signposts_negative[0]
+                signpost_neg_max = self.nf_signposts_negative[-1]
+                rangeval = abs(signpost_neg_min)-abs(signpost_neg_max)
+                off = abs(signpost_neg_max)
+                for s in range(len(self.nf_signposts_negative)):
+                    self.nf_signposts_negative[s] = (self.nf_signposts_negative[s] + off) / rangeval
 
-            signpost_neg_min = self.nf_signposts_negative[0]
-            signpost_neg_max = self.nf_signposts_negative[-1]
-            rangeval = abs(signpost_neg_min)-abs(signpost_neg_max)
-            off = abs(signpost_neg_max)
-            for s in range(len(self.nf_signposts_negative)):
-                self.nf_signposts_negative[s] = (self.nf_signposts_negative[s] + off) / rangeval
+                signpost_pos_min = self.nf_signposts_positive[0]
+                signpost_pos_max = self.nf_signposts_positive[-1]
+                rangeval = abs(signpost_pos_max)-abs(signpost_pos_min)
+                off = abs(signpost_pos_min)
 
-            signpost_pos_min = self.nf_signposts_positive[0]
-            signpost_pos_max = self.nf_signposts_positive[-1]
-            rangeval = abs(signpost_pos_max)-abs(signpost_pos_min)
-            off = abs(signpost_pos_min)
+                for s in range(len(self.nf_signposts_positive)):
+                    self.nf_signposts_positive[s] = (self.nf_signposts_positive[s] - off) / rangeval
 
-            for s in range(len(self.nf_signposts_positive)):
-                self.nf_signposts_positive[s] = (self.nf_signposts_positive[s] - off) / rangeval
+                del self.nf_signposts_positive[0]
 
-            del self.nf_signposts_positive[0]
-
-            # delete last negative value and merge
-            self.nf_signposts = self.nf_signposts_negative + self.nf_signposts_positive
+                # delete last negative value and merge
+                self.nf_signposts = self.nf_signposts_negative + self.nf_signposts_positive
 
             assert (len(self.nf_signposts) == (2 ** self.bits))
 

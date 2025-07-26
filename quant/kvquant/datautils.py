@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 import random
+from datasets import load_dataset
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -174,17 +175,148 @@ def load_tokenizer(model_id, model_type):
     
     return tokenizer
 
-def get_wikitext2(nsamples, seed, seqlen, model):
-    from datasets import load_dataset
-    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
-
-    # Use the robust tokenizer loading
-    model_type = detect_model_type(model)
-    tokenizer = load_tokenizer(model, model_type)
+def get_training_dataset(seed, seqlen, model_path, dataset_name="wikitext2", nsamples=128):
+    """Get training dataset for the specified dataset type"""
     
-    trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
-    testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
+    if dataset_name == "wikitext2":
+        traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+        
+        # Use the model loading utilities for consistency
+        model_type_local = detect_model_type(model_path)
+        tokenizer_local = load_tokenizer(model_path, model_type_local)
+        trainenc = tokenizer_local("\n\n".join(traindata['text']), return_tensors='pt')
+        testenc = tokenizer_local("\n\n".join(testdata['text']), return_tensors='pt')
+        
+    elif dataset_name == "c4":
+        # Use streaming to avoid loading entire C4 dataset into memory
+        import time
+        import os
+        max_retries = 10
+        retry_delay = 10
+        
+        # Set longer timeout for HuggingFace Hub requests
+        os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '120'
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"Loading C4 dataset (attempt {attempt + 1}/{max_retries})...")
+                traindata = load_dataset(
+                    'allenai/c4', 'en', 
+                    split='train',
+                    streaming=True
+                )
+                testdata = load_dataset(
+                    'allenai/c4', 'en', 
+                    split='validation',
+                    streaming=True
+                )
+                print("Successfully loaded C4 dataset")
+                break
+            except Exception as e:
+                print(f"Error loading C4 dataset (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    print(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    print("Failed to load C4 dataset after all retries. Falling back...")
+                    # Fallback to wikitext2 if C4 fails
+                    return get_training_dataset(seed, seqlen, model_path, 'c4', nsamples)
+        
+        # Use the model loading utilities for consistency
+        model_type_local = detect_model_type(model_path)
+        tokenizer_local = load_tokenizer(model_path, model_type_local)
+        
+        # Limit to 2048 * 1200 tokens total to prevent OOM
+        max_tokens = 2048 * 1200
+        
+        # Process training data incrementally
+        train_texts = []
+        train_token_count = 0
+        print(f"Loading C4 training data (target: {max_tokens:,} tokens)...")
+        
+        for item in traindata:
+            text = item['text']
+            if text and text.strip():  # Skip empty texts
+                # Tokenize this individual text to count tokens
+                tokens = tokenizer_local(text, return_tensors='pt')
+                if isinstance(tokens, dict):
+                    token_count = tokens["input_ids"].shape[1]
+                else:
+                    token_count = tokens.input_ids.shape[1]
+                
+                # Check if adding this text would exceed our limit
+                if train_token_count + token_count > max_tokens:
+                    # If this single text would exceed limit, try to take a portion
+                    remaining_tokens = max_tokens - train_token_count
+                    if remaining_tokens > 0:
+                        # Take a portion of this text
+                        words = text.split()
+                        # Rough estimate: take proportional words
+                        word_ratio = remaining_tokens / token_count
+                        target_words = max(1, int(len(words) * word_ratio))
+                        partial_text = " ".join(words[:target_words])
+                        train_texts.append(partial_text)
+                        train_token_count = max_tokens
+                    break
+                else:
+                    train_texts.append(text)
+                    train_token_count += token_count
+                    
+                    if train_token_count >= max_tokens:
+                        break
+        
+        print(f"Loaded {len(train_texts)} training texts with ~{train_token_count:,} tokens")
+        
+        # Process test data with a smaller limit (10% of training data)
+        test_texts = []
+        test_token_count = 0
+        max_test_tokens = max_tokens // 10  # 10% of training data for testing
+        print(f"Loading C4 validation data (target: {max_test_tokens:,} tokens)...")
+        
+        for item in testdata:
+            text = item['text']
+            if text and text.strip():  # Skip empty texts
+                # Tokenize this individual text to count tokens
+                tokens = tokenizer_local(text, return_tensors='pt')
+                if isinstance(tokens, dict):
+                    token_count = tokens["input_ids"].shape[1]
+                else:
+                    token_count = tokens.input_ids.shape[1]
+                
+                # Check if adding this text would exceed our limit
+                if test_token_count + token_count > max_test_tokens:
+                    # If this single text would exceed limit, try to take a portion
+                    remaining_tokens = max_test_tokens - test_token_count
+                    if remaining_tokens > 0:
+                        # Take a portion of this text
+                        words = text.split()
+                        # Rough estimate: take proportional words
+                        word_ratio = remaining_tokens / token_count
+                        target_words = max(1, int(len(words) * word_ratio))
+                        partial_text = " ".join(words[:target_words])
+                        test_texts.append(partial_text)
+                        test_token_count = max_test_tokens
+                    break
+                else:
+                    test_texts.append(text)
+                    test_token_count += token_count
+                    
+                    if test_token_count >= max_test_tokens:
+                        break
+        
+        print(f"Loaded {len(test_texts)} validation texts with ~{test_token_count:,} tokens")
+        
+        # Join texts with newlines for final tokenization
+        trainenc = tokenizer_local("\n".join(train_texts), return_tensors='pt')
+        testenc = tokenizer_local("\n".join(test_texts), return_tensors='pt')
+        
+        # Clean up to save memory
+        del train_texts, test_texts
+        
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset_name}. Choose from 'wikitext2' or 'c4'.")
 
     # Handle both dictionary and object-based tokenizer returns
     if isinstance(trainenc, dict):
@@ -194,183 +326,30 @@ def get_wikitext2(nsamples, seed, seqlen, model):
 
     random.seed(seed)
     trainloader = []
-    for _ in range(nsamples):
-        i = random.randint(0, trainenc_input_ids.shape[1] - seqlen - 1)
+    # Calculate the number of samples that can be generated
+    total_samples = (trainenc_input_ids.shape[1] - seqlen) // seqlen
+    # Limit to the requested number of samples
+    max_samples = min(nsamples, total_samples)
+    for i in range(0, max_samples * seqlen, seqlen):
         j = i + seqlen
         inp = trainenc_input_ids[:, i:j]
         tar = inp.clone()
-        tar[:, :-1] = -100
         trainloader.append((inp, tar))
-    return trainloader, testenc
-
-def get_ptb(nsamples, seed, seqlen, model):
-    from datasets import load_dataset
-    traindata = load_dataset('ptb_text_only', 'penn_treebank', split='train')
-    valdata = load_dataset('ptb_text_only', 'penn_treebank', split='validation')
-
-    # Use the robust tokenizer loading
-    model_type = detect_model_type(model)
-    tokenizer = load_tokenizer(model, model_type)
     
-    trainenc = tokenizer("\n\n".join(traindata['sentence']), return_tensors='pt')
-    testenc = tokenizer("\n\n".join(valdata['sentence']), return_tensors='pt')
+    # Explicitly delete large intermediate tensor if no longer needed directly
+    # trainenc might be large. testenc is returned, so keep it.
+    del inp, tar # from the loop
+    if 'trainenc' in locals() and trainenc is not None:
+        del trainenc
 
-    # Handle both dictionary and object-based tokenizer returns
-    if isinstance(trainenc, dict):
-        trainenc_input_ids = trainenc["input_ids"]
-    else:
-        trainenc_input_ids = trainenc.input_ids
-
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        i = random.randint(0, trainenc_input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc_input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
     return trainloader, testenc
 
-def get_c4(nsamples, seed, seqlen, model):
-    from datasets import load_dataset
-    traindata = load_dataset(
-        'allenai/c4', 'allenai--c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train', use_auth_token=False
-    )
-    valdata = load_dataset(
-        'allenai/c4', 'allenai--c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation', use_auth_token=False
-    )
-
-    # Use the robust tokenizer loading
-    model_type = detect_model_type(model)
-    tokenizer = load_tokenizer(model, model_type)
-
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        while True:
-            i = random.randint(0, len(traindata) - 1)
-            trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
-            # Handle both dictionary and object-based tokenizer returns
-            if isinstance(trainenc, dict):
-                trainenc_input_ids = trainenc["input_ids"]
-            else:
-                trainenc_input_ids = trainenc.input_ids
-            if trainenc_input_ids.shape[1] >= seqlen:
-                break
-        i = random.randint(0, trainenc_input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc_input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
-
-    random.seed(0)
-    valenc = []
-    for _ in range(256):
-        while True:
-            i = random.randint(0, len(valdata) - 1)
-            tmp = tokenizer(valdata[i]['text'], return_tensors='pt')
-            # Handle both dictionary and object-based tokenizer returns
-            if isinstance(tmp, dict):
-                tmp_input_ids = tmp["input_ids"]
-            else:
-                tmp_input_ids = tmp.input_ids
-            if tmp_input_ids.shape[1] >= seqlen:
-                break
-        i = random.randint(0, tmp_input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        valenc.append(tmp_input_ids[:, i:j])
-    valenc = torch.hstack(valenc)
-    class TokenizerWrapper:
-        def __init__(self, input_ids):
-            self.input_ids = input_ids
-    valenc = TokenizerWrapper(valenc)
-
-    return trainloader, valenc
-
-def get_ptb_new(nsamples, seed, seqlen, model):
-    from datasets import load_dataset
-    traindata = load_dataset('ptb_text_only', 'penn_treebank', split='train')
-    testdata = load_dataset('ptb_text_only', 'penn_treebank', split='test')
-
-    # Use the robust tokenizer loading
-    model_type = detect_model_type(model)
-    tokenizer = load_tokenizer(model, model_type)
-    
-    trainenc = tokenizer(" ".join(traindata['sentence']), return_tensors='pt')
-    testenc = tokenizer(" ".join(testdata['sentence']), return_tensors='pt')
-
-    # Handle both dictionary and object-based tokenizer returns
-    if isinstance(trainenc, dict):
-        trainenc_input_ids = trainenc["input_ids"]
-    else:
-        trainenc_input_ids = trainenc.input_ids
-
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        i = random.randint(0, trainenc_input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc_input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
-    return trainloader, testenc
-
-def get_c4_new(nsamples, seed, seqlen, model):
-    from datasets import load_dataset
-    traindata = load_dataset(
-        'allenai/c4', 'allenai--c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
-    )
-    valdata = load_dataset(
-        'allenai/c4', 'allenai--c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
-    )
-
-    # Use the robust tokenizer loading
-    model_type = detect_model_type(model)
-    tokenizer = load_tokenizer(model, model_type)
-
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        while True:
-            i = random.randint(0, len(traindata) - 1)
-            trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
-            # Handle both dictionary and object-based tokenizer returns
-            if isinstance(trainenc, dict):
-                trainenc_input_ids = trainenc["input_ids"]
-            else:
-                trainenc_input_ids = trainenc.input_ids
-            if trainenc_input_ids.shape[1] >= seqlen:
-                break
-        i = random.randint(0, trainenc_input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc_input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
-
-    valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
-    # Handle both dictionary and object-based tokenizer returns
-    if isinstance(valenc, dict):
-        valenc_input_ids = valenc["input_ids"]
-    else:
-        valenc_input_ids = valenc.input_ids
-    valenc_input_ids = valenc_input_ids[:, :(256 * seqlen)]
-
-    class TokenizerWrapper:
-        def __init__(self, input_ids):
-            self.input_ids = input_ids
-    valenc = TokenizerWrapper(valenc_input_ids)
-
-    return trainloader, valenc
 
 def get_loaders(
     name, nsamples=128, seed=0, seqlen=2048, model=''
 ):
     if 'wikitext2' in name:
-        return get_wikitext2(nsamples, seed, seqlen, model)
+        return get_training_dataset(seed, seqlen, model, 'wikitext2', nsamples)
     if 'ptb' in name:
         if 'new' in name:
             return get_ptb_new(nsamples, seed, seqlen, model)
@@ -378,4 +357,4 @@ def get_loaders(
     if 'c4' in name:
         if 'new' in name:
             return get_c4_new(nsamples, seed, seqlen, model)
-        return get_c4(nsamples, seed, seqlen, model)
+        return get_training_dataset(seed, seqlen, model, 'c4', nsamples)
