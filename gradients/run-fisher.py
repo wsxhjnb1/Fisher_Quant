@@ -43,6 +43,7 @@ PROMPT_DICT_NEW={
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
     load: Optional[str] = field(default="")
+    group_size: int = field(default=0, metadata={"help": "Group size for normalization"})
     #save_grad_path: str = field(
     #    metadata={"help": "Path to save the gradients"}
     #)
@@ -64,6 +65,117 @@ class TrainingArguments(transformers.TrainingArguments):
         default=2048,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
+
+
+# Global storage for normalized gradients
+normalized_grads = {}
+
+class GroupNormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, group_size, norm_type, layer_name):
+        B, S, H = x.shape
+        
+        if norm_type == 'sequence':
+            # Keys: sequence-wise grouping
+            if group_size > 0 and S >= group_size:
+                G = S // group_size
+                x_to_group = x[:, :G * group_size, :]
+                x_g = x_to_group.reshape(B, G, group_size, H)
+                x_rest = x[:, G * group_size:, :]
+                
+                mn = x_g.amin(dim=2, keepdim=True)
+                mx = x_g.amax(dim=2, keepdim=True)
+                scale = (mx - mn).clamp(min=1e-6)
+                x_norm = (x_g - mn) / scale
+                
+                # Denormalize for forward pass
+                x_denorm = x_norm * scale + mn
+                denormalized_part = x_denorm.reshape(B, G * group_size, H)
+                output = torch.cat([denormalized_part, x_rest], dim=1)
+                
+                # Store for backward
+                ctx.save_for_backward(x_norm.reshape(B, G * group_size, H), mn, scale)
+                ctx.group_info = (G, group_size, S, H, norm_type, layer_name)
+            else:
+                mn = x.amin(dim=1, keepdim=True)
+                mx = x.amax(dim=1, keepdim=True)
+                scale = (mx - mn).clamp(min=1e-6)
+                x_norm = (x - mn) / scale
+                
+                # Denormalize for forward pass
+                output = x_norm * scale + mn
+                
+                # Store for backward
+                ctx.save_for_backward(x_norm, mn, scale)
+                ctx.group_info = (None, None, S, H, norm_type, layer_name)
+                
+        else:  # token-wise for values
+            if group_size > 0 and H > 0 and H % group_size == 0:
+                G = H // group_size
+                x_g = x.reshape(B, S, G, group_size)
+                
+                mn = x_g.amin(dim=-1, keepdim=True)
+                mx = x_g.amax(dim=-1, keepdim=True)
+                scale = (mx - mn).clamp(min=1e-6)
+                x_norm = (x_g - mn) / scale
+                
+                # Denormalize for forward pass
+                x_denorm = x_norm * scale + mn
+                output = x_denorm.reshape(B, S, H)
+                
+                # Store for backward
+                ctx.save_for_backward(x_norm.reshape(B, S, H), mn, scale)
+                ctx.group_info = (G, group_size, S, H, norm_type, layer_name)
+            else:
+                mn = x.amin(dim=-1, keepdim=True)
+                mx = x.amax(dim=-1, keepdim=True)
+                scale = (mx - mn).clamp(min=1e-6)
+                x_norm = (x - mn) / scale
+                
+                # Denormalize for forward pass
+                output = x_norm * scale + mn
+                
+                # Store for backward
+                ctx.save_for_backward(x_norm, mn, scale)
+                ctx.group_info = (None, None, S, H, norm_type, layer_name)
+        
+        return output
+    
+    @staticmethod
+    def backward(ctx, grad_output):
+        x_norm, mn, scale = ctx.saved_tensors
+        G, group_size, S, H, norm_type, layer_name = ctx.group_info
+        
+        # Correctly calculate gradient w.r.t. x_norm: dL/d(x_norm) = grad_output * scale
+        if G is not None:  # Grouped case
+            if norm_type == 'sequence':
+                # Reshape grad_output to match grouping
+                grad_output_g = grad_output.reshape(-1, G, group_size, H)
+                # Calculate grad w.r.t normalized groups
+                grad_x_norm_g = grad_output_g * scale
+                grad_x_norm = grad_x_norm_g.reshape(-1, S, H)
+            else:  # Token grouping
+                grad_output_g = grad_output.reshape(-1, S, G, group_size)
+                grad_x_norm_g = grad_output_g * scale
+                grad_x_norm = grad_x_norm_g.reshape(-1, S, H)
+        else:  # One-group case
+            grad_x_norm = grad_output * scale
+        
+        global normalized_grads
+        normalized_grads[layer_name] = grad_x_norm.detach()
+        
+        # Return gradient for original input. Since y=x, dy/dx=1, so dL/dx = dL/dy.
+        return grad_output, None, None, None
+
+
+class GroupNormHook:
+    def __init__(self, group_size, norm_type, layer_name):
+        self.group_size = group_size
+        self.norm_type = norm_type
+        self.layer_name = layer_name
+        
+    def __call__(self, module, input, output):
+        return GroupNormFunction.apply(output, self.group_size, self.norm_type, self.layer_name)
 
 
 def smart_tokenizer_and_embedding_resize(
@@ -256,18 +368,17 @@ def train():
     _model = model.model
     _layers = _model.layers
     
-    act_grads = {}
-    def get_act_grad_hook(name):
-        def hook(module, grad_in, grad_out):
-            act_grads[name] = grad_out[0]
-        return hook
-
     grads = {}
 
+    # Register forward hooks for group normalization
     for i, layer in enumerate(_layers):
         k_proj, v_proj = get_modules_kv(layer)
-        k_proj.register_full_backward_hook(get_act_grad_hook(f'k_proj{i}'))
-        v_proj.register_full_backward_hook(get_act_grad_hook(f'v_proj{i}'))
+        
+        # Register forward hooks for group normalization and gradient capture
+        # Keys: sequence-wise grouping
+        k_proj.register_forward_hook(GroupNormHook(model_args.group_size, 'sequence', f'k_proj{i}'))
+        # Values: token-wise grouping  
+        v_proj.register_forward_hook(GroupNormHook(model_args.group_size, 'token', f'v_proj{i}'))
 
     # main loop
     for i, data in tqdm(enumerate(dataloader[:data_args.num_examples])):
@@ -280,28 +391,37 @@ def train():
         loss = outputs.loss
         loss.backward()
 
-        # get grads
+        # get grads from normalized values
+        global normalized_grads
         for i, layer in enumerate(_layers):
             print(f'weight layer {i}')
-            kgrad = (act_grads[f'k_proj{i}'] ** 2).float().cpu()
-            vgrad = (act_grads[f'v_proj{i}'] ** 2).float().cpu()
-
-            if f'k_proj{i}' not in grads:
-                grads[f'k_proj{i}'] = kgrad
-            else:
-                grads[f'k_proj{i}'] = torch.cat((grads[f'k_proj{i}'], kgrad), dim=1)
-            if f'v_proj{i}' not in grads:
-                grads[f'v_proj{i}'] = vgrad
-            else:
-                grads[f'v_proj{i}'] = torch.cat((grads[f'v_proj{i}'], vgrad), dim=1)
+            
+            if f'k_proj{i}' in normalized_grads:
+                kgrad = (normalized_grads[f'k_proj{i}'] ** 2).float().cpu()
+                if f'k_proj{i}' not in grads:
+                    grads[f'k_proj{i}'] = kgrad
+                else:
+                    grads[f'k_proj{i}'] = torch.cat((grads[f'k_proj{i}'], kgrad), dim=1)
+            
+            if f'v_proj{i}' in normalized_grads:
+                vgrad = (normalized_grads[f'v_proj{i}'] ** 2).float().cpu()
+                if f'v_proj{i}' not in grads:
+                    grads[f'v_proj{i}'] = vgrad
+                else:
+                    grads[f'v_proj{i}'] = torch.cat((grads[f'v_proj{i}'], vgrad), dim=1)
+        
+        # Clear normalized grads for next iteration
+        normalized_grads.clear()
 
     ## This is a hacky solution to save the gradients
     # where we overwrite all the weights in the model as the gradients
     # and use HF save_pretrained`
     for i, layer in enumerate(_layers):
         k_proj, v_proj = get_modules_kv(layer)
-        k_proj.weight.data = grads[f'k_proj{i}']
-        v_proj.weight.data = grads[f'v_proj{i}']
+        if f'k_proj{i}' in grads:
+            k_proj.weight.data = grads[f'k_proj{i}']
+        if f'v_proj{i}' in grads:
+            v_proj.weight.data = grads[f'v_proj{i}']
 
     print(f"saving model gradient at {training_args.output_dir}")
     model.save_pretrained(training_args.output_dir)

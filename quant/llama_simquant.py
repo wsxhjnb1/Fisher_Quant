@@ -2,6 +2,7 @@ import time
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 from kvquant.modelutils import *
 from kvquant.datautils import *
@@ -46,123 +47,50 @@ def get_model(model, seqlen, maxseqlen):
     return model
 
 @torch.no_grad()
-def llama_eval(model, testenc, dev):
+def calculate_perplexity(model, testenc, dev=None, delay=0):
+    """Calculate perplexity for model evaluation"""
     print('Evaluating ...')
-    model_type = parse_model(model)
-
+    
+    # Determine device - use provided device or model's device
+    if dev is None:
+        dev = next(model.parameters()).device
+    
+    # Ensure model is on the correct device
+    model = model.to(dev)
+    
+    # Handle both dictionary and object-based tokenizer returns
     if isinstance(testenc, dict):
-        testenc = testenc['input_ids']
+        testenc = testenc["input_ids"]
     else:
         testenc = testenc.input_ids
     nsamples = testenc.numel() // model.seqlen
-
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
-    embeddings = get_embedding(model, model_type)
-    for i in range(len(embeddings)):
-        embeddings[i] = embeddings[i].to(dev)
-    layers[0] = layers[0].to(dev)
-
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros(
-        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
-    )
-    cache = {'i': 0, 'attention_mask': None}
-
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            if 'position_ids' in kwargs:
-                cache['position_ids'] = kwargs['position_ids']
-            if 'position_embeddings' in kwargs:
-                cache['position_embeddings'] = kwargs['position_embeddings']
-            raise ValueError
-        def __getattr__(self, name):
-            try:
-                return super().__getattr__(name)
-            except AttributeError:
-                return getattr(self.module, name)
-
-    layers[0] = Catcher(layers[0])
-    for i in range(nsamples):
-        batch = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(dev)
-        try:
-            model(batch)
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-
-    layers[0] = layers[0].cpu()
-    for i in range(len(embeddings)):
-        embeddings[i] = embeddings[i].cpu()
-    torch.cuda.empty_cache()
-
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache.get('position_ids')
-    position_embeddings = cache.get('position_embeddings')
-
-    for i in range(len(layers)):
-        print("Layer", i)
-        layer = layers[i].to(dev)
-
-        for j in range(nsamples):
-            if model_type == 'opt':
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    attention_mask=attention_mask,
-                )[0]
-            else:
-                # assert model_type == 'llama'
-                layer_kwargs = {
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                }
-                if position_embeddings is not None:
-                    layer_kwargs["position_embeddings"] = position_embeddings
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    **layer_kwargs,
-                )[0]
-
-        layers[i] = layer.cpu()
-        del layer
-        torch.cuda.empty_cache()
-        inps, outs = outs, inps
-
-    norm = get_norm(model, model_type)
-    if norm is not None:
-        norm = norm.to(dev)
-    model.lm_head = model.lm_head.to(dev)
-
-    testenc = testenc.to(dev)
     nlls = []
-    for i in range(nsamples):
-        hidden_states = inps[i].unsqueeze(0)
-        if norm is not None:
-            hidden_states = model.model.norm(hidden_states)
-        lm_logits = model.lm_head(hidden_states)
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[
-            :, (i * model.seqlen):((i + 1) * model.seqlen)
-        ][:, 1:]
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        neg_log_likelihood = loss.float() * model.seqlen
-        nlls.append(neg_log_likelihood)
+    
+    pbar = tqdm(range(nsamples), desc="Calculating perplexity")
+    for i in pbar:
+        input_ids = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(dev)
+        outputs = model(input_ids)
+        logits = outputs.logits
+        
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        
+        loss = nn.CrossEntropyLoss()(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        nlls.append(loss.float() * model.seqlen)
+        
+        # Calculate current average perplexity
+        current_ppl = torch.exp(torch.stack(nlls).sum() / ((i + 1) * model.seqlen))
+        pbar.set_postfix({"Current perplexity": f"{current_ppl.item():.4f}"})
+        
+        if delay > 0:
+            time.sleep(delay)
+    
     ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
     print(ppl.item())
-    model.config.use_cache = use_cache
     return ppl.item()
 
 @torch.no_grad()
-def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match, bits, include_sparse=False, sparsity_threshold=0.999, nuq=False, fisher=None, norm=False, cap_outliers=False, first_few_fp16=False):
+def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match, bits, include_sparse=False, sparsity_threshold=0.999, nuq=False, fisher=None, norm=False, cap_outliers=False, first_few_fp16=False, group_size=-1, one_group=False):
     print('Starting ...')
 
     use_cache = model.config.use_cache
@@ -248,7 +176,9 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
                                         bits,
                                         perchannel=True,
                                         qchannel=0,
-                                        seqlen=model.seqlen
+                                        seqlen=model.seqlen,
+                                        group_size=group_size,
+                                        one_group=one_group
                                      )
             elif name in pertensor_list:
                 simquant[name] = SimQuant(
@@ -256,7 +186,9 @@ def llama_calibration(model, dataloader, dev, perchannel_match, pertensor_match,
                                         bits,
                                         perchannel=True,
                                         qchannel=-1,
-                                        seqlen=model.seqlen
+                                        seqlen=model.seqlen,
+                                        group_size=group_size,
+                                        one_group=one_group
                                      )
             else:
                 continue
@@ -423,6 +355,16 @@ if __name__ == '__main__':
         '--clamp', action='store_true',
         help='Clamp w/ integer quantization'
     )
+    
+    # Group-wise quantization arguments
+    parser.add_argument(
+        '--group-size', type=int, default=-1,
+        help='Size of each group for group-wise quantization (-1 means no grouping)'
+    )
+    parser.add_argument(
+        '--one-group', action='store_true',
+        help='Treat entire dimension as one group'
+    )
 
     DEV = torch.device('cuda:0')
 
@@ -494,7 +436,9 @@ if __name__ == '__main__':
             fisher=fisher,
             norm=args.norm,
             cap_outliers=args.cap_outliers,
-            first_few_fp16=args.first_few_fp16
+            first_few_fp16=args.first_few_fp16,
+            group_size=args.group_size,
+            one_group=args.one_group
         )
 
         with open(args.quantizer_path, 'wb') as handle:
@@ -540,7 +484,9 @@ if __name__ == '__main__':
             norm=args.norm,
             cap_outliers=args.cap_outliers,
             first_few_fp16=args.first_few_fp16,
-            clamp=args.clamp
+            clamp=args.clamp,
+            group_size=args.group_size,
+            one_group=args.one_group
         )
 
         #per-vector quant
@@ -557,8 +503,10 @@ if __name__ == '__main__':
             norm=args.norm,
             cap_outliers=args.cap_outliers,
             first_few_fp16=args.first_few_fp16,
-            clamp=args.clamp
+            clamp=args.clamp,
+            group_size=args.group_size,
+            one_group=args.one_group
         )
 
         #run evaluation
-        llama_eval(model, testloader, DEV)
+        calculate_perplexity(model, testloader, DEV)

@@ -346,7 +346,9 @@ def quant_fn_nuq_recon(
     norm=False,
     normscale=None,
     normoffset=None,
-    first_few_fp16=-1
+    first_few_fp16=-1,
+    group_size=-1,
+    one_group=False
 ):
     """
     inp: weight/act values (2d matrix)
@@ -366,11 +368,14 @@ def quant_fn_nuq_recon(
     Performs simulated NUQ quantization
     """
 
+    inp_shape = inp.shape
+    num_groups = inp_shape[qchannel] // group_size
+
     if first_few_fp16 > -1:
         orig = inp
 
     # set quantization threshold dynamically
-    if dynamicquantization:
+    if dynamicquantization or group_size > 0:
         if include_sparse:
             outliers = inp * outlier_mask
             median = torch.median(inp, dim=qchannel).values
@@ -382,14 +387,22 @@ def quant_fn_nuq_recon(
             maxval = torch.max(tmp_inp, dim=qchannel).values
             minval = torch.min(tmp_inp, dim=qchannel).values
         else:
-            maxval = torch.max(inp, dim=qchannel).values
-            minval = torch.min(inp, dim=qchannel).values
+            if group_size > 0 and not one_group:
+                if qchannel == 0:
+                    inp = inp.reshape(num_groups, group_size, -1)
+                    maxval = torch.max(inp, dim=1, keepdim=True).values
+                    minval = torch.min(inp, dim=1, keepdim=True).values
+                else:
+                    inp = inp.reshape(-1, num_groups, group_size)
+                    maxval = torch.max(inp, dim=-1, keepdim=True).values
+                    minval = torch.min(inp, dim=-1, keepdim=True).values
+            else:
+                maxval = torch.max(inp, dim=qchannel, keepdim=True).values
+                minval = torch.min(inp, dim=qchannel, keepdim=True).values
 
     # compute offset here:
     offset = (maxval + minval) / 2
     rangeval = (maxval - minval) / 2
-    offset = offset.unsqueeze(qchannel)
-    rangeval = rangeval.unsqueeze(qchannel)
 
     # subtract offset
     inp = inp - offset
@@ -440,7 +453,9 @@ class SimQuant:
                     perchannel=True,
                     qchannel=0,
                     include_rope=False,
-                    seqlen=2048
+                    seqlen=2048,
+                    group_size=-1,
+                    one_group=False
                 ):
         self.layer = layer
         self.dev = self.layer.weight.device
@@ -449,6 +464,10 @@ class SimQuant:
         self.qchannel = qchannel
         self.bits = bits
         self.seqlen = seqlen  # Store sequence length
+        
+        # Group-wise quantization parameters
+        self.group_size = group_size
+        self.one_group = one_group
 
         self.rows = W.shape[0]
         self.columns = W.shape[1]
@@ -537,8 +556,22 @@ class SimQuant:
         if self.perchannel:
             #per-channel - remove tokenwise outliers and normalize range to [-1,1]
             # Use torch.quantile instead of np.percentile for GPU acceleration
-            outlier_threshold_upper = torch.quantile(data, t, dim=self.qchannel).unsqueeze(self.qchannel)
-            outlier_threshold_lower = torch.quantile(data, 1-t, dim=self.qchannel).unsqueeze(self.qchannel)
+            if self.group_size > 0 and not self.one_group:
+                data_shape = data.shape
+                num_groups = data_shape[self.qchannel] // self.group_size
+                # Use group-wise quantile computation
+                if self.qchannel == 0:
+                    data = data.reshape(num_groups, self.group_size, -1)
+                    outlier_threshold_upper = torch.quantile(data, t, dim=1, keepdim=True)
+                    outlier_threshold_lower = torch.quantile(data, 1-t, dim=1, keepdim=True)
+                else:
+                    data = data.reshape(-1, num_groups, self.group_size)
+                    outlier_threshold_upper = torch.quantile(data, t, dim=-1, keepdim=True)
+                    outlier_threshold_lower = torch.quantile(data, 1-t, dim=-1, keepdim=True)
+            else:
+                # Use original quantile computation
+                outlier_threshold_upper = torch.quantile(data, t, dim=self.qchannel).unsqueeze(self.qchannel)
+                outlier_threshold_lower = torch.quantile(data, 1-t, dim=self.qchannel).unsqueeze(self.qchannel)
         else:
             #per-token - remove tokenwise outliers and normalize range to [-1,1]
             assert(False) # not currently supported
@@ -649,7 +682,9 @@ class QuantLinearSim(nn.Module):
                     norm=False,
                     first_few_fp16=-1,
                     cap_outliers=-1,
-                    clamp=False
+                    clamp=False,
+                    group_size=-1,
+                    one_group=False
                 ):
 
         super().__init__()
@@ -679,8 +714,8 @@ class QuantLinearSim(nn.Module):
 
         self.include_sparse = include_sparse
         self.sparsity_threshold = sparsity_threshold
-        self.outlier_threshold_upper = torch.tensor(quantizer[0]).cuda().flatten().half()
-        self.outlier_threshold_lower = torch.tensor(quantizer[1]).cuda().flatten().half()
+        self.outlier_threshold_upper = torch.tensor(quantizer[0]).cuda().half()
+        self.outlier_threshold_lower = torch.tensor(quantizer[1]).cuda().half()
 
         self.nuq = nuq
         self.nf_nuq = nf_nuq
@@ -700,6 +735,10 @@ class QuantLinearSim(nn.Module):
 
         self.cap_outliers = cap_outliers
         self.first_few_fp16 = first_few_fp16
+        
+        # Group-wise quantization parameters
+        self.group_size = group_size
+        self.one_group = one_group
 
         # for normalfloat support - compute NF signposts
         if self.nf_nuq:
@@ -833,7 +872,9 @@ class QuantLinearSim(nn.Module):
                     norm=self.norm,
                     normscale=self.normscale,
                     normoffset=self.normoffset,
-                    first_few_fp16=self.first_few_fp16
+                    first_few_fp16=self.first_few_fp16,
+                    group_size=self.group_size,
+                    one_group=self.one_group
                 )
 
         else:
@@ -874,7 +915,9 @@ def make_quant_sim(
                     norm=False,
                     cap_outliers=-1,
                     first_few_fp16=-1,
-                    clamp=False
+                    clamp=False,
+                    group_size=-1,
+                    one_group=False
                   ):
     if isinstance(module, QuantLinearSim):
         return
@@ -900,7 +943,9 @@ def make_quant_sim(
                                                     norm=norm,
                                                     cap_outliers=cap_outliers,
                                                     first_few_fp16=first_few_fp16,
-                                                    clamp=clamp
+                                                    clamp=clamp,
+                                                    group_size=group_size,
+                                                    one_group=one_group
                                                 ))
         del tmp
     for name1, child in module.named_children():
@@ -918,5 +963,7 @@ def make_quant_sim(
                         norm=norm,
                         cap_outliers=cap_outliers,
                         first_few_fp16=first_few_fp16,
-                        clamp=clamp
+                        clamp=clamp,
+                        group_size=group_size,
+                        one_group=one_group
                       )
