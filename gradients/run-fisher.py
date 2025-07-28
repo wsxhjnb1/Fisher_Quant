@@ -159,7 +159,7 @@ class GroupNormFunction(torch.autograd.Function):
                 grad_x_norm_g = grad_output_g * scale
                 grad_x_norm = grad_x_norm_g.reshape(-1, S, H)
         else:  # One-group case
-            grad_x_norm = grad_output * scale
+            grad_x_norm = grad_output
         
         global normalized_grads
         normalized_grads[layer_name] = grad_x_norm.detach()
